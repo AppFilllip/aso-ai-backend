@@ -3,13 +3,18 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import os
-from dotenv import load_dotenv
 import openai
+from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
+APPTWEAK_API_KEY = os.getenv("APPTWEAK_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
 
 app = FastAPI()
 
+# Enable CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,16 +23,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-APPTWEAK_API_KEY = os.getenv("APPTWEAK_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
-
 class AppInfo(BaseModel):
     app_id: str
     app_store: str
-    country: str = "US"
-    competitors: list[str] = []
-    keywords: list[str] = []
+
+class CountryInput(BaseModel):
+    app_id: str
+    country: str
+
+class KeywordInput(BaseModel):
+    app_id: str
+    country: str
+    competitors: list
+
+class MetadataInput(BaseModel):
+    keywords: list
 
 @app.get("/")
 def read_root():
@@ -36,7 +46,11 @@ def read_root():
 @app.post("/analyze")
 def analyze_app(info: AppInfo):
     if info.app_store.lower() == "apple":
-        url = f"https://itunes.apple.com/lookup?id={info.app_id}" if info.app_id.isdigit() else f"https://itunes.apple.com/lookup?bundleId={info.app_id}"
+        if info.app_id.isdigit():
+            url = f"https://itunes.apple.com/lookup?id={info.app_id}"
+        else:
+            url = f"https://itunes.apple.com/lookup?bundleId={info.app_id}"
+
         response = requests.get(url)
         data = response.json()
         if data.get("resultCount", 0) > 0:
@@ -51,64 +65,65 @@ def analyze_app(info: AppInfo):
                 "icon": app_data.get("artworkUrl100"),
                 "status": "Success"
             }
-        return {"status": "App not found on iTunes", "app_id": info.app_id}
+        else:
+            return {"status": "App not found on iTunes", "app_id": info.app_id}
 
     elif info.app_store.lower() == "google":
         try:
-            url = f"https://play.google.com/store/apps/details?id={info.app_id}&hl=en&gl={info.country}"
+            url = f"https://play.google.com/store/apps/details?id={info.app_id}&hl=en&gl=us"
             headers = {"User-Agent": "Mozilla/5.0"}
             response = requests.get(url, headers=headers)
             if response.status_code == 200 and "<title>" in response.text:
-                title_start = response.text.find("<title>") + 7
-                title_end = response.text.find("</title>", title_start)
-                title = response.text[title_start:title_end].replace(" - Apps on Google Play", "")
+                start = response.text.find("<title>") + 7
+                end = response.text.find("</title>", start)
+                title = response.text[start:end].replace(" - Apps on Google Play", "")
                 return {
                     "app_id": info.app_id,
                     "store": "google",
                     "title": title.strip(),
-                    "status": "Success (basic scrape)"
+                    "status": "Success (og:title)"
                 }
-            return {"status": "App not found on Play Store", "app_id": info.app_id}
+            else:
+                return {"status": "App title not found in HTML", "app_id": info.app_id}
         except Exception as e:
             return {"status": f"Error fetching Play Store data: {str(e)}", "app_id": info.app_id}
 
-    return {"status": "Unsupported store. Use 'apple' or 'google'."}
+    else:
+        return {"status": "Unsupported store. Use 'apple' or 'google'"}
 
 @app.post("/suggest-competitors")
-def suggest_competitors(info: AppInfo):
-    url = f"https://api.apptweak.com/api/public/apps/ios/{info.app_id}/competitors.json?country={info.country}"
-    headers = {"X-Apptweak-Key": APPTWEAK_API_KEY}
-    response = requests.get(url, headers=headers)
-    return response.json()
+def suggest_competitors(data: CountryInput):
+    url = f"https://api.apptweak.com/api/v2/apps/{data.app_id}/ios/competitors.json?country={data.country}&auth_token={APPTWEAK_API_KEY}"
+    response = requests.get(url)
+    try:
+        competitors = response.json().get("content", {}).get("competitors", [])
+        return {"app_id": data.app_id, "country": data.country, "competitors": competitors}
+    except:
+        return {"status": "Failed to fetch competitors"}
 
-@app.post("/keywords")
-def keyword_analysis(info: AppInfo):
-    headers = {"X-Apptweak-Key": APPTWEAK_API_KEY}
-    all_keywords = []
-    for app_id in [info.app_id] + info.competitors:
-        url = f"https://api.apptweak.com/api/public/apps/ios/{app_id}/keywords/suggestions.json?country={info.country}"
-        response = requests.get(url, headers=headers)
-        data = response.json()
-        if "content" in data:
-            all_keywords += data["content"].get("keywords", [])
-    return {"app_id": info.app_id, "keywords": list(set(all_keywords)), "status": "Keyword analysis success"}
+@app.post("/fetch-keywords")
+def fetch_keywords(data: KeywordInput):
+    competitor_ids = ",".join(data.competitors)
+    url = f"https://api.apptweak.com/api/v2/keywords/suggestions.json?country={data.country}&app_id={data.app_id}&competitors={competitor_ids}&auth_token={APPTWEAK_API_KEY}"
+    response = requests.get(url)
+    try:
+        keywords = response.json().get("content", {}).get("keywords", [])
+        return {"suggested_keywords": keywords[:20]}
+    except:
+        return {"status": "Failed to fetch keywords"}
 
 @app.post("/generate-metadata")
-def generate_metadata(info: AppInfo):
-    prompt = f"""
-You are an ASO expert. Write ASO metadata for an app with the following inputs:
-App ID: {info.app_id}
-Store: {info.app_store}
-Target Country: {info.country}
-Target Keywords: {', '.join(info.keywords)}
-
-Return:
-1. Title (max 30 characters)
-2. Subtitle (max 30 characters)
-3. Long Description (max 4000 characters) in markdown with emoji and feature list.
-"""
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return {"metadata": response["choices"][0]["message"]["content"], "status": "Generated by ChatGPT"}
+def generate_metadata(data: MetadataInput):
+    prompt = f"Write ASO-optimized metadata for an app using these keywords: {', '.join(data.keywords)}\nReturn title, subtitle, and description."
+    try:
+        completion = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an expert in App Store Optimization."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        response = completion.choices[0].message.content
+        return {"generated_metadata": response.strip()}
+    except Exception as e:
+        return {"status": f"OpenAI error: {str(e)}"}
